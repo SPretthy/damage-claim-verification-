@@ -1,0 +1,6 @@
+claim_id,decision,confidence,supporting_image_ids,damage_type,object_part,severity,risk_flags,justification,extracted_claim
+test-001,insufficient_evidence,0.5,,,,,,,Customer: I need to file a claim for my car. There's damage to the rear bumper from a collision.
+test-002,insufficient_evidence,0.5,,,,,,,Customer: My laptop fell and now the screen has lines across it.
+test-003,insufficient_evidence,0.5,,,,,,,Customer: The package I received is completely crushed and torn.
+test-004,insufficient_evidence,0.5,,,,,,,Customer: My car door was hit in a parking lot. There's a dent on the passenger side.
+test-005,insufficient_evidence,0.5,,,,,,,Customer: I spilled water on my laptop and now it won't turn on.

@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""Database management utility for damage claims verification system."""
+import os
+import sys
+import argparse
+import csv
+import json
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent))
+
+try:
+    from supabase import create_client, Client
+except ImportError:
+    print("Error: supabase package not installed")
+    print("Install with: pip install supabase")
+    sys.exit(1)
+
+
+def get_supabase_client() -> Client:
+    """Get Supabase client from environment variables."""
+    url = os.getenv("VITE_SUPABASE_URL") or os.getenv("SUPABASE_URL")
+    key = os.getenv("VITE_SUPABASE_ANON_KEY") or os.getenv("SUPABASE_ANON_KEY")
+
+    if not url or not key:
+        # Try reading from .env file
+        env_path = Path(__file__).parent / ".env"
+        if env_path.exists():
+            with open(env_path) as f:
+                for line in f:
+                    if line.startswith("VITE_SUPABASE_URL="):
+                        url = line.split("=", 1)[1].strip()
+                    elif line.startswith("VITE_SUPABASE_ANON_KEY="):
+                        key = line.split("=", 1)[1].strip()
+
+    if not url or not key:
+        raise ValueError("Supabase credentials not found in environment or .env file")
+
+    return create_client(url, key)
+
+
+# CLAIMS MANAGEMENT
+
+def create_claim(
+    claim_id: str,
+    user_id: str,
+    conversation: str,
+    image_ids: List[str],
+    object_type: Optional[str] = None,
+    expected_decision: Optional[str] = None,
+    expected_severity: Optional[str] = None
+) -> Dict[str, Any]:
+    """Create a new claim in the database."""
+    client = get_supabase_client()
+
+    data = {
+        "claim_id": claim_id,
+        "user_id": user_id,
+        "conversation": conversation,
+        "image_ids": image_ids,
+        "object_type": object_type,
+        "expected_decision": expected_decision,
+        "expected_severity": expected_severity
+    }
+
+    # Remove None values
+    data = {k: v for k, v in data.items() if v is not None}
+
+    result = client.table("claims").insert(data).execute()
+    return result.data[0] if result.data else None
+
+
+def get_claim(claim_id: str) -> Optional[Dict[str, Any]]:
+    """Get a claim by ID."""
+    client = get_supabase_client()
+    result = client.table("claims").select("*").eq("claim_id", claim_id).execute()
+    return result.data[0] if result.data else None
+
+
+def get_all_claims(limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+    """Get all claims with pagination."""
+    client = get_supabase_client()
+    result = client.table("claims").select("*").order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+    return result.data or []
+
+
+def update_claim(claim_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Update a claim."""
+    client = get_supabase_client()
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    result = client.table("claims").update(updates).eq("claim_id", claim_id).execute()
+    return result.data[0] if result.data else None
+
+
+def delete_claim(claim_id: str) -> bool:
+    """Delete a claim."""
+    client = get_supabase_client()
+    # First delete related results
+    client.table("verification_results").delete().eq("claim_id", claim_id).execute()
+    # Then delete claim
+    result = client.table("claims").delete().eq("claim_id", claim_id).execute()
+    return len(result.data) > 0
+
+
+def import_claims_from_csv(csv_path: str, skip_existing: bool = True) -> int:
+    """Import claims from a CSV file."""
+    client = get_supabase_client()
+    count = 0
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            claim_id = row.get("claim_id", row.get("id"))
+            if not claim_id:
+                continue
+
+            # Check if exists
+            if skip_existing:
+                existing = client.table("claims").select("claim_id").eq("claim_id", claim_id).execute()
+                if existing.data:
+                    continue
+
+            # Parse image IDs
+            image_ids_str = row.get("image_ids", row.get("images", ""))
+            image_ids = [img.strip() for img in image_ids_str.split(";") if img.strip()]
+
+            data = {
+                "claim_id": claim_id,
+                "user_id": row.get("user_id", "unknown"),
+                "conversation": row.get("conversation", ""),
+                "image_ids": image_ids,
+                "object_type": row.get("object_type"),
+                "expected_decision": row.get("expected_decision"),
+                "expected_severity": row.get("expected_severity"),
+                "expected_damage_type": row.get("expected_damage_type"),
+                "expected_part": row.get("expected_part")
+            }
+
+            # Clean None values
+            data = {k: v for k, v in data.items() if v and v != ""}
+
+            try:
+                client.table("claims").insert(data).execute()
+                count += 1
+            except Exception as e:
+                print(f"Error importing {claim_id}: {e}")
+
+    return count
+
+
+# VERIFICATION RESULTS MANAGEMENT
+
+def create_result(
+    claim_id: str,
+    decision: str,
+    confidence: float,
+    supporting_image_ids: List[str],
+    damage_type: Optional[str] = None,
+    object_part: Optional[str] = None,
+    severity: Optional[str] = None,
+    risk_flags: List[str] = None,
+    justification: str = "",
+    extracted_claim: str = "",
+    processing_time_ms: float = 0
+) -> Dict[str, Any]:
+    """Create a verification result."""
+    client = get_supabase_client()
+
+    data = {
+        "claim_id": claim_id,
+        "decision": decision,
+        "confidence": confidence,
+        "supporting_image_ids": supporting_image_ids or [],
+        "damage_type": damage_type,
+        "object_part": object_part,
+        "severity": severity,
+        "risk_flags": risk_flags or [],
+        "justification": justification,
+        "extracted_claim": extracted_claim,
+        "processing_time_ms": processing_time_ms
+    }
+
+    result = client.table("verification_results").insert(data).execute()
+    return result.data[0] if result.data else None
+
+
+def get_result(claim_id: str) -> Optional[Dict[str, Any]]:
+    """Get verification result for a claim."""
+    client = get_supabase_client()
+    result = client.table("verification_results").select("*").eq("claim_id", claim_id).execute()
+    return result.data[0] if result.data else None
+
+
+def get_all_results(limit: int = 100) -> List[Dict[str, Any]]:
+    """Get all verification results."""
+    client = get_supabase_client()
+    result = client.table("verification_results").select("*").order("created_at", desc=True).limit(limit).execute()
+    return result.data or []
+
+
+def update_result(claim_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Update a verification result."""
+    client = get_supabase_client()
+    result = client.table("verification_results").update(updates).eq("claim_id", claim_id).execute()
+    return result.data[0] if result.data else None
+
+
+def delete_result(claim_id: str) -> bool:
+    """Delete a verification result."""
+    client = get_supabase_client()
+    result = client.table("verification_results").delete().eq("claim_id", claim_id).execute()
+    return len(result.data) > 0
+
+
+# USER HISTORY MANAGEMENT
+
+def create_user_history(
+    user_id: str,
+    total_claims: int = 0,
+    approved_claims: int = 0,
+    rejected_claims: int = 0,
+    flagged_claims: int = 0,
+    fraud_flags: int = 0
+) -> Dict[str, Any]:
+    """Create user history record."""
+    client = get_supabase_client()
+
+    data = {
+        "user_id": user_id,
+        "total_claims": total_claims,
+        "approved_claims": approved_claims,
+        "rejected_claims": rejected_claims,
+        "flagged_claims": flagged_claims,
+        "fraud_flags": fraud_flags
+    }
+
+    result = client.table("user_history").insert(data).execute()
+    return result.data[0] if result.data else None
+
+
+def get_user_history(user_id: str) -> Optional[Dict[str, Any]]:
+    """Get user history."""
+    client = get_supabase_client()
+    result = client.table("user_history").select("*").eq("user_id", user_id).execute()
+    return result.data[0] if result.data else None
+
+
+def update_user_history(user_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Update user history."""
+    client = get_supabase_client()
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    result = client.table("user_history").update(updates).eq("user_id", user_id).execute()
+    return result.data[0] if result.data else None
+
+
+def increment_user_stats(user_id: str, field: str, increment: int = 1) -> bool:
+    """Increment a user statistic."""
+    client = get_supabase_client()
+
+    # Get current value
+    history = get_user_history(user_id)
+    if not history:
+        create_user_history(user_id)
+        history = {"total_claims": 0, "approved_claims": 0, "rejected_claims": 0, "flagged_claims": 0, "fraud_flags": 0}
+
+    if field not in history:
+        return False
+
+    new_value = (history.get(field) or 0) + increment
+
+    result = client.table("user_history").update({field: new_value}).eq("user_id", user_id).execute()
+    return len(result.data) > 0
+
+
+# UTILITY FUNCTIONS
+
+def export_claims_to_csv(output_path: str) -> int:
+    """Export all claims to CSV."""
+    claims = get_all_claims(limit=1000)
+
+    if not claims:
+        print("No claims to export")
+        return 0
+
+    fieldnames = [
+        "claim_id", "user_id", "conversation", "image_ids", "object_type",
+        "expected_decision", "expected_severity", "expected_damage_type", "expected_part"
+    ]
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+
+        for claim in claims:
+            # Convert image_ids array to string
+            if isinstance(claim.get("image_ids"), list):
+                claim["image_ids"] = ";".join(claim["image_ids"])
+            writer.writerow(claim)
+
+    return len(claims)
+
+
+def export_results_to_csv(output_path: str) -> int:
+    """Export all results to CSV."""
+    results = get_all_results(limit=1000)
+
+    if not results:
+        print("No results to export")
+        return 0
+
+    fieldnames = [
+        "claim_id", "decision", "confidence", "supporting_image_ids",
+        "damage_type", "object_part", "severity", "risk_flags",
+        "justification", "extracted_claim"
+    ]
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+
+        for result in results:
+            # Convert arrays to strings
+            if isinstance(result.get("supporting_image_ids"), list):
+                result["supporting_image_ids"] = ";".join(result["supporting_image_ids"])
+            if isinstance(result.get("risk_flags"), list):
+                result["risk_flags"] = ";".join(result["risk_flags"])
+            writer.writerow(result)
+
+    return len(results)
+
+
+def get_database_stats() -> Dict[str, Any]:
+    """Get database statistics."""
+    client = get_supabase_client()
+
+    claims = client.table("claims").select("claim_id", count="exact").execute()
+    results = client.table("verification_results").select("claim_id", count="exact").execute()
+    users = client.table("user_history").select("user_id", count="exact").execute()
+
+    # Get decision breakdown
+    supported = client.table("verification_results").select("claim_id", count="exact").eq("decision", "supported").execute()
+    contradicted = client.table("verification_results").select("claim_id", count="exact").eq("decision", "contradicted").execute()
+    insufficient = client.table("verification_results").select("claim_id", count="exact").eq("decision", "insufficient_evidence").execute()
+
+    return {
+        "total_claims": claims.count if hasattr(claims, "count") else len(claims.data or []),
+        "total_results": results.count if hasattr(results, "count") else len(results.data or []),
+        "total_users": users.count if hasattr(users, "count") else len(users.data or []),
+        "decision_breakdown": {
+            "supported": supported.count if hasattr(supported, "count") else 0,
+            "contradicted": contradicted.count if hasattr(contradicted, "count") else 0,
+            "insufficient_evidence": insufficient.count if hasattr(insufficient, "count") else 0
+        }
+    }
+
+
+def clear_all_data(confirm: bool = False) -> Dict[str, int]:
+    """Clear all data from database (use with caution)."""
+    if not confirm:
+        print("WARNING: This will delete ALL data. Pass --confirm to proceed.")
+        return {}
+
+    client = get_supabase_client()
+
+    # Delete in order due to foreign keys
+    results = client.table("verification_results").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+    claims = client.table("claims").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+    history = client.table("user_history").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+
+    return {
+        "claims_deleted": len(claims.data or []),
+        "results_deleted": len(results.data or []),
+        "history_deleted": len(history.data or [])
+    }
+
+
+# CLI INTERFACE
+
+def main():
+    parser = argparse.ArgumentParser(description="Database management for damage claims system")
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # Claims commands
+    claims_parser = subparsers.add_parser("claims", help="Manage claims")
+    claims_subparsers = claims_parser.add_subparsers(dest="action")
+
+    claims_list = claims_subparsers.add_parser("list", help="List claims")
+    claims_list.add_argument("--limit", type=int, default=10)
+    claims_list.add_argument("--json", action="store_true", help="Output as JSON")
+
+    claims_get = claims_subparsers.add_parser("get", help="Get a claim")
+    claims_get.add_argument("claim_id", help="Claim ID")
+
+    claims_create = claims_subparsers.add_parser("create", help="Create a claim")
+    claims_create.add_argument("--claim-id", required=True)
+    claims_create.add_argument("--user-id", required=True)
+    claims_create.add_argument("--conversation", required=True)
+    claims_create.add_argument("--images", required=True, help="Semicolon-separated image IDs")
+    claims_create.add_argument("--object-type")
+
+    claims_import = claims_subparsers.add_parser("import", help="Import claims from CSV")
+    claims_import.add_argument("file", help="CSV file path")
+    claims_import.add_argument("--skip-existing", action="store_true", default=True)
+
+    claims_delete = claims_subparsers.add_parser("delete", help="Delete a claim")
+    claims_delete.add_argument("claim_id", help="Claim ID")
+
+    claims_export = claims_subparsers.add_parser("export", help="Export claims to CSV")
+    claims_export.add_argument("--output", "-o", default="claims_export.csv")
+
+    # Results commands
+    results_parser = subparsers.add_parser("results", help="Manage verification results")
+    results_subparsers = results_parser.add_subparsers(dest="action")
+
+    results_list = results_subparsers.add_parser("list", help="List results")
+    results_list.add_argument("--limit", type=int, default=10)
+    results_list.add_argument("--json", action="store_true")
+
+    results_get = results_subparsers.add_parser("get", help="Get result for a claim")
+    results_get.add_argument("claim_id")
+
+    results_export = results_subparsers.add_parser("export", help="Export results to CSV")
+    results_export.add_argument("--output", "-o", default="results_export.csv")
+
+    # Users commands
+    users_parser = subparsers.add_parser("users", help="Manage user history")
+    users_subparsers = users_parser.add_subparsers(dest="action")
+
+    users_get = users_subparsers.add_parser("get", help="Get user history")
+    users_get.add_argument("user_id")
+
+    # Stats command
+    subparsers.add_parser("stats", help="Show database statistics")
+
+    # Clear command
+    clear_parser = subparsers.add_parser("clear", help="Clear all data (DANGEROUS)")
+    clear_parser.add_argument("--confirm", action="store_true", help="Confirm deletion")
+
+    args = parser.parse_args()
+
+    if args.command == "claims":
+        if args.action == "list":
+            claims = get_all_claims(limit=args.limit)
+            if args.json:
+                print(json.dumps(claims, indent=2))
+            else:
+                for c in claims:
+                    print(f"ID: {c['claim_id']} | User: {c['user_id']} | Type: {c.get('object_type', 'N/A')}")
+                    print(f"   Conversation: {c['conversation'][:80]}...")
+                    print()
+
+        elif args.action == "get":
+            claim = get_claim(args.claim_id)
+            if claim:
+                print(json.dumps(claim, indent=2, default=str))
+            else:
+                print(f"Claim not found: {args.claim_id}")
+
+        elif args.action == "create":
+            image_ids = [img.strip() for img in args.images.split(";")]
+            result = create_claim(
+                claim_id=args.claim_id,
+                user_id=args.user_id,
+                conversation=args.conversation,
+                image_ids=image_ids,
+                object_type=args.object_type
+            )
+            print(f"Created claim: {result['claim_id']}")
+
+        elif args.action == "import":
+            count = import_claims_from_csv(args.file, args.skip_existing)
+            print(f"Imported {count} claims")
+
+        elif args.action == "delete":
+            if delete_claim(args.claim_id):
+                print(f"Deleted claim: {args.claim_id}")
+            else:
+                print(f"Claim not found: {args.claim_id}")
+
+        elif args.action == "export":
+            count = export_claims_to_csv(args.output)
+            print(f"Exported {count} claims to {args.output}")
+
+    elif args.command == "results":
+        if args.action == "list":
+            results = get_all_results(limit=args.limit)
+            if args.json:
+                print(json.dumps(results, indent=2))
+            else:
+                for r in results:
+                    print(f"Claim: {r['claim_id']} | Decision: {r['decision']} | Confidence: {r['confidence']}")
+                    if r.get('justification'):
+                        print(f"   {r['justification'][:80]}...")
+                    print()
+
+        elif args.action == "get":
+            result = get_result(args.claim_id)
+            if result:
+                print(json.dumps(result, indent=2, default=str))
+            else:
+                print(f"Result not found for claim: {args.claim_id}")
+
+        elif args.action == "export":
+            count = export_results_to_csv(args.output)
+            print(f"Exported {count} results to {args.output}")
+
+    elif args.command == "users":
+        if args.action == "get":
+            history = get_user_history(args.user_id)
+            if history:
+                print(json.dumps(history, indent=2, default=str))
+                print(f"\nRisk Score: {calculate_risk_score(history):.2f}")
+            else:
+                print(f"User not found: {args.user_id}")
+
+    elif args.command == "stats":
+        stats = get_database_stats()
+        print("DATABASE STATISTICS")
+        print("=" * 40)
+        print(f"Total Claims: {stats['total_claims']}")
+        print(f"Total Results: {stats['total_results']}")
+        print(f"Total Users: {stats['total_users']}")
+        print("\nDecision Breakdown:")
+        for decision, count in stats['decision_breakdown'].items():
+            print(f"  {decision}: {count}")
+
+    elif args.command == "clear":
+        result = clear_all_data(confirm=args.confirm)
+        if result:
+            print(f"Cleared: {result}")
+
+    else:
+        parser.print_help()
+
+
+def calculate_risk_score(history: Dict[str, Any]) -> float:
+    """Calculate user risk score."""
+    if not history:
+        return 0.0
+
+    total = history.get("total_claims", 0)
+    if total == 0:
+        return 0.0
+
+    approved = history.get("approved_claims", 0)
+    fraud_flags = history.get("fraud_flags", 0)
+
+    approval_rate = approved / total
+    fraud_factor = min(fraud_flags * 0.2, 0.5)
+    frequency_factor = min((total - 5) * 0.02, 0.3) if total > 5 else 0
+
+    return min((1 - approval_rate + fraud_factor + frequency_factor) / 3, 1.0)
+
+
+if __name__ == "__main__":
+    main()
